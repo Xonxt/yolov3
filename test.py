@@ -7,6 +7,8 @@ from models import *
 from utils.datasets import *
 from utils.utils import *
 
+# import HHI Dataset format:
+from hhi_dataset.dataset import (Dataset as HHIDataset)
 
 def test(cfg,
          data,
@@ -53,17 +55,33 @@ def test(cfg,
         verbose = False
 
     # Configure run
-    data = parse_data_cfg(data)
-    nc = 1 if single_cls else int(data['classes'])  # number of classes
-    path = data['valid']  # path to test images
-    names = load_classes(data['names'])  # class names
+    
+    # check if using HHI Json Dataset Format:
+    USING_HHI_JSON = ('json' in os.path.splitext(data)[-1].lower())
+
+    # Configure run
+    if USING_HHI_JSON and os.path.isfile(data):
+        ds = HHIDataset(data)
+        path = data
+        rect_classes = ds.get_squished_classes(types=['rectangle'])
+        nc = len(rect_classes)
+        names = list(rect_classes.keys())
+    else:
+        data = parse_data_cfg(data)
+        nc = 1 if single_cls else int(data['classes'])  # number of classes
+        path = data['valid']  # path to test images
+        names = load_classes(data['names'])  # class names
+        
     iouv = torch.linspace(0.5, 0.95, 10).to(device)  # iou vector for mAP@0.5:0.95
     iouv = iouv[0].view(1)  # comment for mAP@0.5:0.95
     niou = iouv.numel()
 
     # Dataloader
     if dataloader is None:
-        dataset = LoadImagesAndLabels(path, imgsz, batch_size, rect=True, single_cls=opt.single_cls, pad=0.5)
+        # Select Data loader type, based on path extension
+        DatasetLoader = LoadHHIDataset if USING_HHI_JSON else LoadImagesAndLabels
+        
+        dataset = DatasetLoader(path, imgsz, batch_size, rect=True, single_cls=opt.single_cls, pad=0.5)
         batch_size = min(batch_size, len(dataset))
         dataloader = DataLoader(dataset,
                                 batch_size=batch_size,

@@ -16,6 +16,10 @@ from tqdm import tqdm
 
 from utils.utils import xyxy2xywh, xywh2xyxy
 
+# import HHI Dataset format:
+from hhi_dataset.dataset import (Dataset as HHIDataset, unpack_annotation)
+from hhi_dataset import tools as HHITools
+
 help_url = 'https://github.com/ultralytics/yolov3/wiki/Train-Custom-Data'
 img_formats = ['.bmp', '.jpg', '.jpeg', '.png', '.tif', '.tiff', '.dng']
 vid_formats = ['.mov', '.avi', '.mp4', '.mpg', '.mpeg', '.m4v', '.wmv', '.mkv']
@@ -522,6 +526,201 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         for i, l in enumerate(label):
             l[:, 0] = i  # add target image index for build_targets()
         return torch.stack(img, 0), torch.cat(label, 0), path, shapes
+    
+    
+# the HHI Json Dataset Loader
+class LoadHHIDataset(LoadImagesAndLabels):  # for training/testing
+    def __init__(self, path, img_size=416, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
+                 cache_images=False, single_cls=False, pad=0.0, rgb=False):
+        try:
+            path = str(Path(path))  # os-agnostic
+            parent = str(Path(path).parent) + os.sep
+
+            # open the dataset:
+            self.dataset = HHIDataset(path)
+        except:
+            raise Exception('Error loading data from %s. See %s' % (path, help_url))
+
+        # get teh list of all images and annotations:
+        self.img_files = []
+        self.annotations = []
+        self.img_format = []
+        for idx in range(len(self.dataset)):
+            image_data = self.dataset.get_item(idx).get('data') or []
+            for src_idx in range(len(image_data)):
+                current_image_data = image_data[src_idx]
+                image_path = self.dataset.get_image_path(current_image_data.get('image'))
+                if image_path is None:
+                    continue
+                self.img_files.append(image_path)
+                self.img_format.append(current_image_data.get('image_format'))
+                annotations = unpack_annotation(current_image_data, self.dataset.get_classes(), unnormalize=False, rect_xywh2xyxy=False)
+                rectangles = [obj for obj in annotations if obj['class_type'] == 'rectangle']
+                self.annotations.append(rectangles)
+
+        # get size
+        n = len(self.img_files)
+
+        assert n > 0, 'No images found in %s. See %s' % (path, help_url)
+        bi = np.floor(np.arange(n) / batch_size).astype(np.int)  # batch index
+        nb = bi[-1] + 1  # number of batches
+
+        self.n = n  # number of images
+        self.batch = bi  # batch index of image
+        self.img_size = img_size
+        self.augment = augment
+        self.hyp = hyp
+        self.image_weights = image_weights
+        self.rect = False if image_weights else rect
+        self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
+
+        # Read image shapes (wh)
+        sp = os.path.splitext(path)[0] + '.shapes'  # shapefile path
+        try:
+            with open(sp, 'r') as f:  # read existing shapefile
+                s = [x.split() for x in f.read().splitlines()]
+                assert len(s) == n, 'Shapefile out of sync'
+        except:
+            s = [exif_size(Image.open(f)) for f in tqdm(self.img_files, desc='Reading image shapes')]
+            np.savetxt(sp, s, fmt='%g')  # overwrites existing (if any)
+
+        self.shapes = np.array(s, dtype=np.float64)
+
+        # Rectangular Training  https://github.com/ultralytics/yolov3/issues/232
+        if self.rect:
+            # Sort by aspect ratio
+            s = self.shapes  # wh
+            ar = s[:, 1] / s[:, 0]  # aspect ratio
+            irect = ar.argsort()
+            self.img_files = [self.img_files[i] for i in irect]
+            self.annotations = [self.annotations[i] for i in irect]
+            self.shapes = s[irect]  # wh
+            ar = ar[irect]
+
+            # Set training image shapes
+            shapes = [[1, 1]] * nb
+            for i in range(nb):
+                ari = ar[bi == i]
+                mini, maxi = ari.min(), ari.max()
+                if maxi < 1:
+                    shapes[i] = [maxi, 1]
+                elif mini > 1:
+                    shapes[i] = [1, 1 / mini]
+
+            self.batch_shapes = np.ceil(np.array(shapes) * img_size / 32. + pad).astype(np.int) * 32
+
+        # Cache labels
+        self.imgs = [None] * n
+        self.labels = [np.zeros((0, 5), dtype=np.float32)] * n
+        create_datasubset, extract_bounding_boxes, labels_loaded = False, False, False
+        nm, nf, ne, ns, nd = 0, 0, 0, 0, 0  # number missing, found, empty, datasubset, duplicate
+        np_labels_path = os.path.join(os.path.dirname(path), os.path.basename(os.path.dirname(path)) + '.npy')  # saved labels in *.npy file
+
+        s = np_labels_path  # print string
+        if os.path.isfile(np_labels_path):
+            #s = np_labels_path  # print string
+            x = np.load(np_labels_path, allow_pickle=True)
+            if len(x) == n:
+                self.labels = x
+                labels_loaded = True
+
+        # 'squished' class-ids, that start from 0 and go [0,1,2,3,...] instead of possibly [1, 5, 9, ...]
+        class_ids = self.dataset.get_squished_classes(types=['rectangle'])
+
+        pbar = tqdm(self.annotations)
+        # for i, file in enumerate(pbar):
+        for i, rects in enumerate(pbar):
+            file = self.img_files[i]
+            if labels_loaded:
+                l = self.labels[i]
+                # np.savetxt(file, l, '%g')  # save *.txt from *.npy file
+            else:
+                try:
+                    # with open(file, 'r') as f:
+                        # l = np.array([x.split() for x in f.read().splitlines()], dtype=np.float32)
+                    l = []
+                    for obj in rects:
+                        rect = obj.get('object').squeeze()
+                        class_name = obj.get('class_name')
+                        class_id = int((class_ids.get(class_name) or {}).get('new_id'))
+                        l.append(np.hstack([class_id, rect]))
+                    l = np.asarray(l)
+
+                except:
+                    nm += 1  # print('missing labels for image %s' % self.img_files[i])  # file missing
+                    continue
+
+            if l.shape[0]:
+                assert l.shape[1] == 5, '> 5 label columns: %s' % file
+                assert (l >= 0).all(), 'negative labels: %s' % file
+                assert (l[:, 1:] <= 1).all(), 'non-normalized or out of bounds coordinate labels: %s' % file
+                if np.unique(l, axis=0).shape[0] < l.shape[0]:  # duplicate rows
+                    nd += 1  # print('WARNING: duplicate rows in %s' % self.label_files[i])  # duplicate rows
+                if single_cls:
+                    l[:, 0] = 0  # force dataset into single-class mode
+                self.labels[i] = l
+                nf += 1  # file found
+
+                # Create subdataset (a smaller dataset)
+                if create_datasubset and ns < 1E4:
+                    if ns == 0:
+                        create_folder(path='./datasubset')
+                        os.makedirs('./datasubset/images')
+                    exclude_classes = 43
+                    if exclude_classes not in l[:, 0]:
+                        ns += 1
+                        # shutil.copy(src=self.img_files[i], dst='./datasubset/images/')  # copy image
+                        with open('./datasubset/images.txt', 'a') as f:
+                            f.write(self.img_files[i] + '\n')
+
+                # Extract object detection boxes for a second stage classifier
+                if extract_bounding_boxes:
+                    p = Path(self.img_files[i])
+                    img = cv2.imread(str(p))
+                    h, w = img.shape[:2]
+                    for j, x in enumerate(l):
+                        f = '%s%sclassifier%s%g_%g_%s' % (p.parent.parent, os.sep, os.sep, x[0], j, p.name)
+                        if not os.path.exists(Path(f).parent):
+                            os.makedirs(Path(f).parent)  # make new output folder
+
+                        b = x[1:] * [w, h, w, h]  # box
+                        b[2:] = b[2:].max()  # rectangle to square
+                        b[2:] = b[2:] * 1.3 + 30  # pad
+                        b = xywh2xyxy(b.reshape(-1, 4)).ravel().astype(np.int)
+
+                        b[[0, 2]] = np.clip(b[[0, 2]], 0, w)  # clip boxes outside of image
+                        b[[1, 3]] = np.clip(b[[1, 3]], 0, h)
+                        assert cv2.imwrite(f, img[b[1]:b[3], b[0]:b[2]]), 'Failure extracting classifier boxes'
+            else:
+                ne += 1  # print('empty labels for image %s' % self.img_files[i])  # file empty
+                # os.system("rm '%s' '%s'" % (self.img_files[i], self.label_files[i]))  # remove
+
+            pbar.desc = 'Caching labels %s (%g found, %g missing, %g empty, %g duplicate, for %g images)' % (
+                s, nf, nm, ne, nd, n)
+        assert nf > 0 or n == 20288, 'No labels found in %s. See %s' % (os.path.dirname(file) + os.sep, help_url)
+        if not labels_loaded and n > 1000:
+            print('Saving labels to %s for faster future loading' % np_labels_path)
+            np.save(np_labels_path, self.labels)  # save for next time
+
+        # Cache images into memory for faster training (WARNING: large datasets may exceed system RAM)
+        if cache_images:  # if training
+            gb = 0  # Gigabytes of cached images
+            pbar = tqdm(range(len(self.img_files)), desc='Caching images')
+            self.img_hw0, self.img_hw = [None] * n, [None] * n
+            for i in pbar:  # max 10k images
+                self.imgs[i], self.img_hw0[i], self.img_hw[i] = load_image(self, i)  # img, hw_original, hw_resized
+                gb += self.imgs[i].nbytes
+                pbar.desc = 'Caching images (%.1fGB)' % (gb / 1E9)
+
+        # Detect corrupted images https://medium.com/joelthchao/programmatically-detect-corrupted-image-8c1b2006c3d3
+        detect_corrupted_images = False
+        if detect_corrupted_images:
+            from skimage import io  # conda install -c conda-forge scikit-image
+            for file in tqdm(self.img_files, desc='Detecting corrupted images'):
+                try:
+                    _ = io.imread(file)
+                except:
+                    print('Corrupted image detected: %s' % file)
 
 
 def load_image(self, index):
@@ -532,6 +731,15 @@ def load_image(self, index):
         img = cv2.imread(path)  # BGR
         assert img is not None, 'Image Not Found ' + path
         h0, w0 = img.shape[:2]  # orig hw
+        
+        # check image format:
+        try:
+            img_format = self.img_format[index]
+            if img_format == 'RGB':
+                img[..., :3] = cv2.cvtColor(img[..., :3], cv2.COLOR_RGB2BGR)
+        except:
+            pass
+        
         r = self.img_size / max(h0, w0)  # resize image to img_size
         if r != 1:  # always resize down, only resize up if training with augmentation
             interp = cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR

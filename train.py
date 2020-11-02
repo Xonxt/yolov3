@@ -14,8 +14,11 @@ mixed_precision = True
 try:  # Mixed precision training https://github.com/NVIDIA/apex
     from apex import amp
 except:
-    print('Apex recommended for faster mixed precision training: https://github.com/NVIDIA/apex')
+    #print('Apex recommended for faster mixed precision training: https://github.com/NVIDIA/apex')
     mixed_precision = False  # not installed
+    
+# import HHI Dataset format:
+from hhi_dataset.dataset import (Dataset as HHIDataset)
 
 wdir = 'weights' + os.sep  # weights dir
 last = wdir + 'last.pt'
@@ -77,10 +80,23 @@ def train(hyp):
 
     # Configure run
     init_seeds()
-    data_dict = parse_data_cfg(data)
-    train_path = data_dict['train']
-    test_path = data_dict['valid']
-    nc = 1 if opt.single_cls else int(data_dict['classes'])  # number of classes
+    
+    # check if using HHI Json Dataset Format:
+    USING_HHI_JSON = ('json' in os.path.splitext(data)[-1].lower())
+    
+    if USING_HHI_JSON and os.path.isfile(data):
+        ds = HHIDataset(data)
+        train_path = data
+        test_path = data
+        rect_classes = ds.get_squished_classes(types=['rectangle'])
+        nc = len(rect_classes)
+        class_names = list(rect_classes.keys())
+    else:
+        data_dict = parse_data_cfg(data)
+        train_path = data_dict['train']
+        test_path = data_dict['valid']
+        nc = 1 if opt.single_cls else int(data_dict['classes'])  # number of classes
+        
     hyp['cls'] *= nc / 80  # update coco-tuned hyp['cls'] to current dataset
 
     # Remove previous results
@@ -188,14 +204,18 @@ def train(hyp):
                                 rank=0)  # distributed training node rank
         model = torch.nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
         model.yolo_layers = model.module.yolo_layers  # move yolo layer indices to top level
+        
+        
+    # Select Data loader type, based on path extension
+    DatasetLoader = LoadHHIDataset if USING_HHI_JSON else LoadImagesAndLabels
 
     # Dataset
-    dataset = LoadImagesAndLabels(train_path, img_size, batch_size,
-                                  augment=True,
-                                  hyp=hyp,  # augmentation hyperparameters
-                                  rect=opt.rect,  # rectangular training
-                                  cache_images=opt.cache_images,
-                                  single_cls=opt.single_cls)
+    dataset = DatasetLoader(train_path, img_size, batch_size,
+                            augment=True,
+                            hyp=hyp,  # augmentation hyperparameters
+                            rect=opt.rect,  # rectangular training
+                            cache_images=opt.cache_images,
+                            single_cls=opt.single_cls)
 
     # Dataloader
     batch_size = min(batch_size, len(dataset))
@@ -208,11 +228,11 @@ def train(hyp):
                                              collate_fn=dataset.collate_fn)
 
     # Testloader
-    testloader = torch.utils.data.DataLoader(LoadImagesAndLabels(test_path, imgsz_test, batch_size,
-                                                                 hyp=hyp,
-                                                                 rect=True,
-                                                                 cache_images=opt.cache_images,
-                                                                 single_cls=opt.single_cls),
+    testloader = torch.utils.data.DataLoader(DatasetLoader(test_path, imgsz_test, batch_size,
+                                                           hyp=hyp,
+                                                           rect=True,
+                                                           cache_images=opt.cache_images,
+                                                           single_cls=opt.single_cls),
                                              batch_size=batch_size,
                                              num_workers=nw,
                                              pin_memory=True,
