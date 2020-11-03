@@ -55,23 +55,29 @@ def test(cfg,
         verbose = False
 
     # Configure run
-    
+
     # check if using HHI Json Dataset Format:
     USING_HHI_JSON = ('json' in os.path.splitext(data)[-1].lower())
 
     # Configure run
     if USING_HHI_JSON and os.path.isfile(data):
-        ds = HHIDataset(data)
-        path = data
-        rect_classes = ds.get_squished_classes(types=['rectangle'])
-        nc = len(rect_classes)
-        names = list(rect_classes.keys())
+        hhi_dataset = HHIDataset(data)
+        _, valid = hhi_dataset.split_training_data(types=['rectangle'], val_fraction=0.2, shuffle=True);
+        rect_classes = hhi_dataset.get_squished_classes(types=['rectangle'])
+        data = {
+            'valid': {'path': data, 'dataset': valid},
+            'names': list(rect_classes.keys()),
+            'classes': len(rect_classes)
+        }
+        names = data['names']  # class names
     else:
         data = parse_data_cfg(data)
-        nc = 1 if single_cls else int(data['classes'])  # number of classes
-        path = data['valid']  # path to test images
         names = load_classes(data['names'])  # class names
-        
+
+    nc = 1 if single_cls else int(data['classes'])  # number of classes
+
+    path = data['valid']  # path to test images
+
     iouv = torch.linspace(0.5, 0.95, 10).to(device)  # iou vector for mAP@0.5:0.95
     iouv = iouv[0].view(1)  # comment for mAP@0.5:0.95
     niou = iouv.numel()
@@ -80,7 +86,7 @@ def test(cfg,
     if dataloader is None:
         # Select Data loader type, based on path extension
         DatasetLoader = LoadHHIDataset if USING_HHI_JSON else LoadImagesAndLabels
-        
+
         dataset = DatasetLoader(path, imgsz, batch_size, rect=True, single_cls=opt.single_cls, pad=0.5)
         batch_size = min(batch_size, len(dataset))
         dataloader = DataLoader(dataset,

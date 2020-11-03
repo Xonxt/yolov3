@@ -526,37 +526,24 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         for i, l in enumerate(label):
             l[:, 0] = i  # add target image index for build_targets()
         return torch.stack(img, 0), torch.cat(label, 0), path, shapes
-    
-    
+
+
 # the HHI Json Dataset Loader
 class LoadHHIDataset(LoadImagesAndLabels):  # for training/testing
     def __init__(self, path, img_size=416, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
                  cache_images=False, single_cls=False, pad=0.0, rgb=False):
         try:
-            path = str(Path(path))  # os-agnostic
+            dataset = path['dataset']
+
+            self.img_files = [d['path'] for d in dataset]
+            self.annotations = [d['labels'] for d in dataset]
+            self.img_format = [d['img_format'] for d in dataset]
+
+            path = str(Path(path['path']))
             parent = str(Path(path).parent) + os.sep
 
-            # open the dataset:
-            self.dataset = HHIDataset(path)
         except:
             raise Exception('Error loading data from %s. See %s' % (path, help_url))
-
-        # get teh list of all images and annotations:
-        self.img_files = []
-        self.annotations = []
-        self.img_format = []
-        for idx in range(len(self.dataset)):
-            image_data = self.dataset.get_item(idx).get('data') or []
-            for src_idx in range(len(image_data)):
-                current_image_data = image_data[src_idx]
-                image_path = self.dataset.get_image_path(current_image_data.get('image'))
-                if image_path is None:
-                    continue
-                self.img_files.append(image_path)
-                self.img_format.append(current_image_data.get('image_format'))
-                annotations = unpack_annotation(current_image_data, self.dataset.get_classes(), unnormalize=False, rect_xywh2xyxy=False)
-                rectangles = [obj for obj in annotations if obj['class_type'] == 'rectangle']
-                self.annotations.append(rectangles)
 
         # get size
         n = len(self.img_files)
@@ -624,9 +611,6 @@ class LoadHHIDataset(LoadImagesAndLabels):  # for training/testing
                 self.labels = x
                 labels_loaded = True
 
-        # 'squished' class-ids, that start from 0 and go [0,1,2,3,...] instead of possibly [1, 5, 9, ...]
-        class_ids = self.dataset.get_squished_classes(types=['rectangle'])
-
         pbar = tqdm(self.annotations)
         # for i, file in enumerate(pbar):
         for i, rects in enumerate(pbar):
@@ -636,13 +620,11 @@ class LoadHHIDataset(LoadImagesAndLabels):  # for training/testing
                 # np.savetxt(file, l, '%g')  # save *.txt from *.npy file
             else:
                 try:
-                    # with open(file, 'r') as f:
-                        # l = np.array([x.split() for x in f.read().splitlines()], dtype=np.float32)
                     l = []
                     for obj in rects:
                         rect = obj.get('object').squeeze()
                         class_name = obj.get('class_name')
-                        class_id = int((class_ids.get(class_name) or {}).get('new_id'))
+                        class_id = obj.get('new_id')
                         l.append(np.hstack([class_id, rect]))
                     l = np.asarray(l)
 
@@ -731,7 +713,7 @@ def load_image(self, index):
         img = cv2.imread(path)  # BGR
         assert img is not None, 'Image Not Found ' + path
         h0, w0 = img.shape[:2]  # orig hw
-        
+
         # check image format:
         try:
             img_format = self.img_format[index]
@@ -739,7 +721,7 @@ def load_image(self, index):
                 img[..., :3] = cv2.cvtColor(img[..., :3], cv2.COLOR_RGB2BGR)
         except:
             pass
-        
+
         r = self.img_size / max(h0, w0)  # resize image to img_size
         if r != 1:  # always resize down, only resize up if training with augmentation
             interp = cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR

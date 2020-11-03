@@ -16,7 +16,7 @@ try:  # Mixed precision training https://github.com/NVIDIA/apex
 except:
     #print('Apex recommended for faster mixed precision training: https://github.com/NVIDIA/apex')
     mixed_precision = False  # not installed
-    
+
 # import HHI Dataset format:
 from hhi_dataset.dataset import (Dataset as HHIDataset)
 
@@ -80,23 +80,28 @@ def train(hyp):
 
     # Configure run
     init_seeds()
-    
+
     # check if using HHI Json Dataset Format:
     USING_HHI_JSON = ('json' in os.path.splitext(data)[-1].lower())
-    
+
     if USING_HHI_JSON and os.path.isfile(data):
-        ds = HHIDataset(data)
-        train_path = data
-        test_path = data
-        rect_classes = ds.get_squished_classes(types=['rectangle'])
-        nc = len(rect_classes)
-        class_names = list(rect_classes.keys())
+        hhi_dataset = HHIDataset(data)
+        train, valid = hhi_dataset.split_training_data(types=['rectangle'], val_fraction=0.1, shuffle=True)
+        rect_classes = hhi_dataset.get_squished_classes(types=['rectangle'])
+        data_dict = {
+            'train': {'path': data, 'dataset': train},
+            'valid': {'path': data, 'dataset': valid},
+            'names': list(rect_classes.keys()),
+            'classes': len(rect_classes)
+        }
+        print(f"Dataset is split into {len(train)} training samples and {len(valid)} validation samples")
     else:
         data_dict = parse_data_cfg(data)
-        train_path = data_dict['train']
-        test_path = data_dict['valid']
-        nc = 1 if opt.single_cls else int(data_dict['classes'])  # number of classes
         
+    train_path = data_dict['train']
+    test_path = data_dict['valid']
+    nc = 1 if opt.single_cls else int(data_dict['classes'])  # number of classes    
+
     hyp['cls'] *= nc / 80  # update coco-tuned hyp['cls'] to current dataset
 
     # Remove previous results
@@ -204,8 +209,8 @@ def train(hyp):
                                 rank=0)  # distributed training node rank
         model = torch.nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
         model.yolo_layers = model.module.yolo_layers  # move yolo layer indices to top level
-        
-        
+
+
     # Select Data loader type, based on path extension
     DatasetLoader = LoadHHIDataset if USING_HHI_JSON else LoadImagesAndLabels
 
