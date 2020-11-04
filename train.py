@@ -86,7 +86,7 @@ def train(hyp):
 
     if USING_HHI_JSON and os.path.isfile(data):
         hhi_dataset = HHIDataset(data)
-        train, valid = hhi_dataset.split_training_data(types=['rectangle'], val_fraction=0.1, shuffle=True)
+        train, valid = hhi_dataset.split_training_data(types=['rectangle'], val_fraction=float(opt.val_size), shuffle=True)
         rect_classes = hhi_dataset.get_squished_classes(types=['rectangle'])
         data_dict = {
             'train': {'path': data, 'dataset': train},
@@ -97,10 +97,10 @@ def train(hyp):
         print(f"Dataset is split into {len(train)} training samples and {len(valid)} validation samples")
     else:
         data_dict = parse_data_cfg(data)
-        
+
     train_path = data_dict['train']
     test_path = data_dict['valid']
-    nc = 1 if opt.single_cls else int(data_dict['classes'])  # number of classes    
+    nc = 1 if opt.single_cls else int(data_dict['classes'])  # number of classes
 
     hyp['cls'] *= nc / 80  # update coco-tuned hyp['cls'] to current dataset
 
@@ -420,6 +420,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type=int, default=16)  # effective bs = batch_size * accumulate = 16 * 4 = 64
     parser.add_argument('--cfg', type=str, default='cfg/yolov3-spp.cfg', help='*.cfg path')
     parser.add_argument('--data', type=str, default='data/coco2017.data', help='*.data path')
+    parser.add_argument('--val-size', type=float, default=0.1, help='fraction of the Json Dataset, used for validation')
     parser.add_argument('--multi-scale', action='store_true', help='adjust (67%% - 150%%) img_size every 10 batches')
     parser.add_argument('--img-size', nargs='+', type=int, default=[320, 640], help='[min_train, max-train, test]')
     parser.add_argument('--rect', action='store_true', help='rectangular training')
